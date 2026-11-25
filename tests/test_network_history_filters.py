@@ -1,10 +1,7 @@
-from datetime import datetime, timedelta
-
 import pytest
+from datetime import datetime, timedelta, timezone
 
 from test_network_test_validation import VALID_TEST, post_test
-
-
 def save_history_record(client, timestamp, score):
     payload = {
         **VALID_TEST,
@@ -50,7 +47,7 @@ def test_connectivity_score_filter_includes_boundaries(client):
     scores = [59, 60, 75, 90, 91, None]
 
     # Generate timestamps within the existing 24-hour history window.
-    base_time = datetime.now().replace(microsecond=0) - timedelta(
+    base_time = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(
         minutes=len(scores) - 1
     )
 
@@ -257,7 +254,7 @@ def test_history_time_ranges_filter_correctly(
     outside_window,
     inside_window,
 ):
-    now = datetime.now().replace(microsecond=0)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
 
     older_timestamp = (
         now - outside_window

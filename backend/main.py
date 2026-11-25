@@ -30,7 +30,7 @@ import subprocess
 import re
 
 import statistics
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 # ============================================================
 # AI MODEL IMPORTS
@@ -1040,19 +1040,12 @@ def network_quality():
 
 
 @app.post("/api/network-test")
-
 def save_network_test(data: NetworkTest):
 
-
-
     timestamp = (
-
         data.timestamp
-
-        or datetime.now().isoformat()
-
+        or datetime.now(timezone.utc).isoformat()
     )
-
 
 
 
@@ -1261,7 +1254,7 @@ def get_network_history(
         if start_date is None and end_date is None:
             if range != "all":
                 duration = HISTORY_RANGE_WINDOWS[range]
-                since = datetime.now() - duration
+                since = datetime.now(timezone.utc) - duration
                 conditions.append("timestamp >= ?")
                 parameters.append(since.isoformat())
 
