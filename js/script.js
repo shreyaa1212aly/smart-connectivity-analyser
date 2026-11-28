@@ -15,6 +15,8 @@ let testInProgress = false;
 let speedTest = null;
 let speedTestTimeout = null;
 let networkChart = null;
+let forecastChart = null;
+let latestForecastData = null;
 let connectivityMap = null;
 let userMarker = null;
 let savedMarkers = [];
@@ -170,6 +172,7 @@ async function initializeApplication() {
     updateApplicationReadiness();
     updateAIAnalysis();
     updateAISectionsFromBackend();
+    loadConnectivityForecast();
     updateNetworkRecommendation();
 
     startSessionTimer();
@@ -227,6 +230,12 @@ function setupButtons() {
         "click",
         findBetterArea
     );
+
+    $("forecastMetric")?.addEventListener("change", (event) => {
+        if (latestForecastData) {
+            updateForecastChart(latestForecastData, event.target.value);
+        }
+    });
 }
 
 const STATUS_INDICATOR_CLASSES = Object.freeze([
@@ -368,6 +377,7 @@ function setupNetworkListeners() {
     window.addEventListener("resize", () => {
         connectivityMap?.invalidateSize();
         networkChart?.resize();
+        forecastChart?.resize();
     });
 
     setInterval(() => {
@@ -1662,17 +1672,18 @@ async function startNetworkTest() {
 
         updateHistoryChart(sessionTests);
         updateSessionStatistics();
-
         // Do not save an empty record when every check failed.
         if (outcome?.state !== "error") {
             await saveNetworkTest(entry);
+
             preserveLastCompletedDiagnostic(
                 outcome,
-                 currentMetrics,
-                 lastTestTime
+                currentMetrics,
+                lastTestTime
             );
-        }
 
+            await loadConnectivityForecast();
+     }
 
         setText("testMessage", describeOutcome(profile, outcome));
 
@@ -2797,6 +2808,410 @@ async function updateAISectionsFromBackend() {
     }
 }
 
+/* =========================================================
+   CONNECTIVITY FORECAST
+   ========================================================= */
+
+const FORECAST_METRIC_META = Object.freeze({
+    connectivity_score: { label: "Connectivity Score", unit: "/100", decimals: 1 },
+    download_mbps: { label: "Download Speed", unit: "Mbps", decimals: 1 },
+    upload_mbps: { label: "Upload Speed", unit: "Mbps", decimals: 1 },
+    ping_ms: { label: "Ping", unit: "ms", decimals: 1 },
+    jitter_ms: { label: "Jitter", unit: "ms", decimals: 1 },
+    packet_loss: { label: "Packet Loss", unit: "%", decimals: 2 }
+});
+
+function resolveForecastRiskMeta(level) {
+    const normalized = typeof level === "string" ? level.trim().toLowerCase() : "";
+    if (normalized === "high") {
+        return {
+            key: "high",
+            label: "High Risk",
+            iconClass: "fa-solid fa-triangle-exclamation"
+        };
+    }
+    if (normalized === "moderate") {
+        return {
+            key: "moderate",
+            label: "Moderate Risk",
+            iconClass: "fa-solid fa-circle-exclamation"
+        };
+    }
+    if (normalized === "low") {
+        return {
+            key: "low",
+            label: "Low Risk",
+            iconClass: "fa-solid fa-circle-check"
+        };
+    }
+    if (
+        normalized === "insufficient data" ||
+        normalized === "insufficient_data" ||
+        normalized === "insufficient"
+    ) {
+        return {
+            key: "insufficient",
+            label: "Insufficient Data",
+            iconClass: "fa-solid fa-circle-info"
+        };
+    }
+    return {
+        key: "unavailable",
+        label: "Pending Forecast",
+        iconClass: "fa-solid fa-circle-info"
+    };
+}
+
+function formatForecastRange(metricEntry, decimals = 1) {
+    if (!metricEntry || typeof metricEntry !== "object") return "Unavailable";
+    const predicted = safeNumber(metricEntry.predicted);
+    const lower = safeNumber(metricEntry.lower);
+    const upper = safeNumber(metricEntry.upper);
+    const unit = metricEntry.unit || "";
+
+    if (predicted === null) return "Unavailable";
+    const mainText = formatMetric(predicted, unit, decimals);
+    if (lower === null || upper === null) return mainText;
+    return `${mainText} (${lower.toFixed(decimals)} – ${upper.toFixed(decimals)})`;
+}
+
+function normalizeForecastResponse(payload) {
+    if (!payload || typeof payload !== "object" || !Array.isArray(payload.horizons)) {
+        return null;
+    }
+
+    const horizons = payload.horizons.filter(
+        (item) =>
+            item &&
+            typeof item.horizon === "string" &&
+            item.metrics &&
+            typeof item.metrics === "object"
+    );
+
+    if (horizons.length === 0) {
+        return null;
+    }
+
+    return {
+        success: Boolean(payload.success),
+        generated_at: payload.generated_at || null,
+        history_summary: payload.history_summary || {},
+        degradation_risk: payload.degradation_risk || {
+            level: "Insufficient Data",
+            score: null,
+            reasons: []
+        },
+        horizons
+    };
+}
+
+function updateForecastRiskBadge(risk) {
+    const badge = $("forecastRiskBadge");
+    const icon = $("forecastRiskIcon");
+    const text = $("forecastRiskText");
+    if (!badge || !text) return;
+
+    const meta = resolveForecastRiskMeta(risk?.level);
+    badge.dataset.risk = meta.key;
+
+    const score = safeNumber(risk?.score);
+    text.textContent =
+        score !== null &&
+        meta.key !== "unavailable" &&
+        meta.key !== "insufficient"
+            ? `${meta.label} (${Math.round(score)}/100)`
+            : meta.label;
+
+    if (icon) {
+        icon.className = meta.iconClass;
+    }
+}
+
+function updateForecastChart(forecastData, metricKey = "connectivity_score") {
+    const container = $("forecastChartContainer");
+    const canvas = $("forecastChart");
+    if (!container || !canvas) return;
+
+    const normalized = normalizeForecastResponse(forecastData);
+    if (!normalized) {
+        container.hidden = true;
+        return;
+    }
+
+    const meta = FORECAST_METRIC_META[metricKey] || FORECAST_METRIC_META.connectivity_score;
+    const points = normalized.horizons.map((item) => item.metrics?.[metricKey] || {});
+    const hasValues = points.some((m) => safeNumber(m.predicted) !== null);
+
+    if (!hasValues) {
+        container.hidden = true;
+        return;
+    }
+
+    container.hidden = false;
+    const baseline = safeNumber(points[0]?.baseline);
+    const labels = baseline !== null
+        ? ["Now", ...normalized.horizons.map((h) => `+${h.horizon}`)]
+        : normalized.horizons.map((h) => `+${h.horizon}`);
+
+    const predictedSeries = baseline !== null
+        ? [baseline, ...points.map((m) => safeNumber(m.predicted))]
+        : points.map((m) => safeNumber(m.predicted));
+
+    const upperSeries = baseline !== null
+        ? [baseline, ...points.map((m) => safeNumber(m.upper))]
+        : points.map((m) => safeNumber(m.upper));
+
+    const lowerSeries = baseline !== null
+        ? [baseline, ...points.map((m) => safeNumber(m.lower))]
+        : points.map((m) => safeNumber(m.lower));
+
+    canvas.setAttribute(
+        "aria-label",
+        `${meta.label} forecast chart across ${normalized.horizons.map((h) => h.horizon).join(", ")} horizons.`
+    );
+
+    if (typeof Chart === "undefined") {
+        return;
+    }
+
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    if (forecastChart) {
+        forecastChart.data.labels = labels;
+        forecastChart.data.datasets[0].data = upperSeries;
+        forecastChart.data.datasets[1].data = lowerSeries;
+        forecastChart.data.datasets[2].label = `Predicted ${meta.label} (${meta.unit})`;
+        forecastChart.data.datasets[2].data = predictedSeries;
+        forecastChart.update();
+        return;
+    }
+
+    forecastChart = new Chart(context, {
+        type: "line",
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: "Upper Confidence Bound",
+                    data: upperSeries,
+                    borderColor: "rgba(139, 92, 246, 0.35)",
+                    borderDash: [4, 4],
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    fill: false,
+                    tension: 0.3
+                },
+                {
+                    label: "Lower Confidence Bound",
+                    data: lowerSeries,
+                    borderColor: "rgba(139, 92, 246, 0.35)",
+                    backgroundColor: "rgba(139, 92, 246, 0.14)",
+                    borderDash: [4, 4],
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    fill: "-1",
+                    tension: 0.3
+                },
+                {
+                    label: `Predicted ${meta.label} (${meta.unit})`,
+                    data: predictedSeries,
+                    borderColor: "#7c3aed",
+                    backgroundColor: "rgba(124, 58, 237, 0.15)",
+                    borderWidth: 2.5,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    fill: false,
+                    tension: 0.3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+                legend: { display: true }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true
+                }
+            }
+        }
+    });
+}
+
+function renderForecastSection(payload, unavailableMessage = null) {
+    const statusEl = $("forecastStatus");
+    const horizonsEl = $("forecastHorizons");
+    const reasonsEl = $("forecastRiskReasons");
+    const chartContainer = $("forecastChartContainer");
+    const normalized = normalizeForecastResponse(payload);
+
+    if (!normalized) {
+        latestForecastData = null;
+        updateForecastRiskBadge(null);
+        if (horizonsEl) {
+            while (horizonsEl.firstChild) horizonsEl.removeChild(horizonsEl.firstChild);
+        }
+        if (reasonsEl) {
+            while (reasonsEl.firstChild) reasonsEl.removeChild(reasonsEl.firstChild);
+            reasonsEl.hidden = true;
+        }
+        if (chartContainer) chartContainer.hidden = true;
+        if (statusEl) {
+            statusEl.textContent =
+                unavailableMessage ||
+                "Connectivity forecast is currently unavailable.";
+        }
+        return;
+    }
+
+    const summary = normalized.history_summary || {};
+    const totalRecords = safeNumber(summary.total_records, 0);
+    const hasHistory = totalRecords > 0;
+    const isFallback = !hasHistory || Boolean(summary.fallback_used) || summary.sufficient_history === false;
+
+    latestForecastData = normalized;
+    updateForecastRiskBadge(
+        isFallback
+            ? { level: "Insufficient Data", score: null }
+            : normalized.degradation_risk
+    );
+
+    if (statusEl) {
+        if (!hasHistory) {
+            statusEl.textContent =
+                "Not enough historical measurements yet. Run a connectivity test to start forecasting.";
+        } else if (isFallback) {
+            statusEl.textContent =
+                `Sparse-history fallback active (${totalRecords} saved measurement${totalRecords === 1 ? "" : "s"}). Confidence ranges narrow as more tests accumulate.`;
+        } else {
+            statusEl.textContent =
+                `Forecast computed from ${totalRecords} measurements across ${summary.window_count || 0} rolling time windows.`;
+        }
+    }
+
+    if (horizonsEl) {
+        while (horizonsEl.firstChild) horizonsEl.removeChild(horizonsEl.firstChild);
+
+        if (hasHistory) {
+            normalized.horizons.forEach((entry) => {
+            const card = document.createElement("article");
+            card.className = "forecast-horizon-card";
+
+            const header = document.createElement("div");
+            header.className = "forecast-horizon-header";
+
+            const title = document.createElement("h3");
+            title.className = "forecast-horizon-title";
+            title.textContent = `+${entry.horizon} Horizon`;
+
+            const riskLevel = isFallback
+                ? "Insufficient Data"
+                : (entry.degradation_risk?.level || "Insufficient Data");
+            const riskMeta = resolveForecastRiskMeta(riskLevel);
+            const miniBadge = document.createElement("span");
+            miniBadge.className = "forecast-risk-badge";
+            miniBadge.dataset.risk = riskMeta.key;
+            const miniIcon = document.createElement("i");
+            miniIcon.className = riskMeta.iconClass;
+            miniIcon.setAttribute("aria-hidden", "true");
+            const miniLabel = document.createElement("span");
+            miniLabel.textContent = riskMeta.label;
+            miniBadge.append(miniIcon, miniLabel);
+
+            header.append(title, miniBadge);
+
+            const scoreMetric = entry.metrics?.connectivity_score;
+            const scoreEl = document.createElement("div");
+            scoreEl.className = "forecast-horizon-score";
+            const predScore = safeNumber(scoreMetric?.predicted);
+            scoreEl.textContent =
+                predScore !== null ? `${predScore.toFixed(1)} / 100` : "Unavailable";
+
+            const rangeEl = document.createElement("p");
+            rangeEl.className = "forecast-horizon-range";
+            rangeEl.textContent =
+                predScore !== null
+                    ? `Range: ${formatForecastRange(scoreMetric, 1)}`
+                    : "Collect more measurements to project score range";
+
+            const list = document.createElement("dl");
+            list.className = "forecast-horizon-metrics";
+
+            const rows = [
+                ["Download", entry.metrics?.download_mbps, 1],
+                ["Upload", entry.metrics?.upload_mbps, 1],
+                ["Ping", entry.metrics?.ping_ms, 1],
+                ["Packet Loss", entry.metrics?.packet_loss, 2]
+            ];
+
+            rows.forEach(([label, metricVal, dec]) => {
+                const dt = document.createElement("dt");
+                dt.textContent = label;
+                const dd = document.createElement("dd");
+                const num = safeNumber(metricVal?.predicted);
+                dd.textContent =
+                    num !== null ? formatMetric(num, metricVal?.unit || "", dec) : "—";
+                list.append(dt, dd);
+            });
+
+                card.append(header, scoreEl, rangeEl, list);
+                horizonsEl.appendChild(card);
+            });
+        }
+    }
+
+    if (reasonsEl) {
+        while (reasonsEl.firstChild) reasonsEl.removeChild(reasonsEl.firstChild);
+        const reasons = Array.isArray(normalized.degradation_risk?.reasons)
+            ? normalized.degradation_risk.reasons
+            : [];
+        if (reasons.length > 0) {
+            reasons.forEach((reason) => {
+                const li = document.createElement("li");
+                li.textContent = `• ${reason}`;
+                reasonsEl.appendChild(li);
+            });
+            reasonsEl.hidden = false;
+        } else {
+            reasonsEl.hidden = true;
+        }
+    }
+
+    const selectedMetric = $("forecastMetric")?.value || "connectivity_score";
+    updateForecastChart(normalized, selectedMetric);
+}
+
+async function loadConnectivityForecast(horizons = "1h,6h,24h") {
+    try {
+        const params = new URLSearchParams({ horizons });
+        const response = await fetch(
+            `${API_BASE}/predict/forecast?${params.toString()}`,
+            { cache: "no-store" }
+        );
+        if (!response.ok) {
+            renderForecastSection(
+                null,
+                "Forecast service is currently unavailable."
+            );
+            return null;
+        }
+        const payload = await response.json();
+        renderForecastSection(payload);
+        return payload;
+    } catch (error) {
+        console.info("Backend connectivity forecast unavailable:", error.message);
+        renderForecastSection(
+            null,
+            "Forecast service is unavailable. Check backend connection."
+        );
+        return null;
+    }
+}
+
 function updateNetworkRecommendation() {
     let recommendation =
         "Continue monitoring your connection.";
@@ -3186,7 +3601,12 @@ const smartConnectivity = {
     updateDashboard,
     updateNetworkStatus,
     resolveNetworkType,
-    detectNetworkType
+    detectNetworkType,
+    normalizeForecastResponse,
+    resolveForecastRiskMeta,
+    formatForecastRange,
+    loadConnectivityForecast,
+    renderForecastSection
 };
 
 /* ─── Browser Exports ───────────────────────────────── */
@@ -3233,6 +3653,9 @@ if (typeof window !== "undefined") {
 
     window.detectNetworkType =
         detectNetworkType;
+
+    window.loadConnectivityForecast =
+        loadConnectivityForecast;
 }
 
 /* ─── Node.js Exports for Tests ─────────────────────── */
@@ -3272,6 +3695,11 @@ if (typeof module !== "undefined" && module.exports) {
         resolveNetworkType,
         detectNetworkType,
         formatDnsStatus,
+        normalizeForecastResponse,
+        resolveForecastRiskMeta,
+        formatForecastRange,
+        loadConnectivityForecast,
+        renderForecastSection,
         formatProtocolSummary,
         runNetworkProtocolTest
     };
