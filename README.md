@@ -117,6 +117,15 @@ Before running the project locally, make sure you have:
 - A modern web browser.
 - Visual Studio Code or another code editor (VS Code Live Server is recommended for the frontend).
 
+### Browser capabilities
+
+The dashboard checks only the browser features used by its location tools:
+
+- Location detection requires the Geolocation API and a secure context (HTTPS or localhost). The browser asks for permission when location detection is requested. If permission is denied, allow location access in the browser's site settings and try again. Browsers that do not expose geolocation cannot use location detection.
+- Saving map points requires writable browser local storage. Private browsing policies, disabled storage, or a full storage quota can make this unavailable; the dashboard reports this without disabling network tests, history, or other sections.
+
+These checks do not collect browser fingerprinting data or access location before the user selects **Detect Location**. Optional browser permission-state reporting may be unavailable; the result of the location request remains the source of truth.
+
 **Python compatibility:** PyTorch and other dependencies may have operating-system and Python-version requirements. If installation fails, check the dependency versions and use a supported Python environment.
 
 ## 🚀 Getting Started

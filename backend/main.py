@@ -1321,19 +1321,43 @@ def ai_anomaly():
 
 @app.get("/api/ai/analyze")
 def ai_analyze():
-    if not AI_MODELS_READY:
-        return {
-            "success": False,
-            "available": False,
-            "message": AI_MODELS_MESSAGE,
-            "prediction": None,
-            "anomaly": None,
-        }
+    results = {}
+    errors = {}
+
+    for name, analysis in (
+        ("prediction", ai_prediction),
+        ("anomaly", ai_anomaly),
+    ):
+        try:
+            results[name] = analysis()
+        except HTTPException as error:
+            # Keep the component failure useful to API clients without
+            # returning exception details that may expose implementation data.
+            errors[name] = {
+                "status_code": error.status_code,
+                "message": (
+                    "AI component is unavailable."
+                    if error.status_code == 503
+                    else "Analysis failed."
+                ),
+            }
+        except Exception:
+            errors[name] = {
+                "status_code": 500,
+                "message": "Analysis failed.",
+            }
+
+    succeeded = len(results)
+    failed = len(errors)
+    status = "success" if not failed else "error" if not succeeded else "partial"
 
     return {
-        "success": True,
-        "prediction": ai_prediction(),
-        "anomaly": ai_anomaly(),
+        "success": succeeded == 2,
+        "available": succeeded > 0,
+        "status": status,
+        "prediction": results.get("prediction"),
+        "anomaly": results.get("anomaly"),
+        "errors": errors,
     }
 
 
